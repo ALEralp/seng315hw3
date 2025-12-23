@@ -22,17 +22,17 @@ type GUI struct {
 	Win           fyne.Window
 	Node          *P2PNode
 	
-	// UI Components
 	ChatContainer *fyne.Container
 	MsgInput      *widget.Entry
 	ChannelList   *widget.List
+	NickLabel     *widget.Label
 	
 	ActiveChannel string
 }
 
 func NewGUI(node *P2PNode) *GUI {
 	a := app.New()
-	w := a.NewWindow("P2P Chat v2 - " + node.Nick)
+	w := a.NewWindow("P2P Chat v3 - " + node.Nick)
 	w.Resize(fyne.NewSize(900, 600))
 
 	gui := &GUI{
@@ -52,7 +52,24 @@ func (g *GUI) Run() {
 }
 
 func (g *GUI) setupUI() {
-	// --- Sidebar (Channels Only) ---
+	// --- Sidebar ---
+	
+	// 1. Profile Section (New in V3)
+	profileLabel := widget.NewLabelWithStyle("Profile", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	g.NickLabel = widget.NewLabel("Nick: " + g.Node.Nick)
+	
+	uuidEntry := widget.NewEntry()
+	uuidEntry.SetText(g.Node.StableID)
+	uuidEntry.Disable() // Read-only
+	
+	copyBtn := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), func() {
+		g.Win.Clipboard().SetContent(g.Node.StableID)
+	})
+	uuidRow := container.NewBorder(nil, nil, nil, copyBtn, uuidEntry)
+	
+	profileBox := container.NewVBox(profileLabel, g.NickLabel, uuidRow, widget.NewSeparator())
+
+	// 2. Channel List
 	g.ChannelList = widget.NewList(
 		func() int {
 			g.Node.Mutex.RLock()
@@ -60,8 +77,10 @@ func (g *GUI) setupUI() {
 			return len(g.Node.Channels)
 		},
 		func() fyne.CanvasObject {
+			// Using Border to put delete button on right
 			label := widget.NewLabel("Channel")
-			return container.NewPadded(label)
+			btn := widget.NewButtonWithIcon("", theme.DeleteIcon(), nil)
+			return container.NewBorder(nil, nil, nil, btn, label)
 		},
 		func(i widget.ListItemID, o fyne.CanvasObject) {
 			g.Node.Mutex.RLock()
@@ -74,21 +93,40 @@ func (g *GUI) setupUI() {
 			id := keys[i]
 			ch := g.Node.Channels[id]
 			unread := ch.Unread
+			isLocked := ch.Password != ""
 			g.Node.Mutex.RUnlock()
 
-			// Simple container logic
 			c := o.(*fyne.Container)
-			label := c.Objects[0].(*widget.Label)
-			
+			label := c.Objects[0].(*widget.Label) // Center
+			btn := c.Objects[1].(*widget.Button)  // Right
+
 			txt := id
+			if isLocked {
+				txt = "🔒 " + txt
+			}
 			if unread > 0 {
-				txt = fmt.Sprintf("%s (%d)", id, unread)
+				txt = fmt.Sprintf("%s (%d)", txt, unread)
 			}
 			label.SetText(txt)
+			
 			if id == g.ActiveChannel {
 				label.TextStyle = fyne.TextStyle{Bold: true}
 			} else {
 				label.TextStyle = fyne.TextStyle{}
+			}
+
+			// Delete button logic
+			btn.OnTapped = func() {
+				dialog.ShowConfirm("Leave", "Leave "+id+"?", func(ok bool) {
+					if ok {
+						g.Node.LeaveChannel(id)
+						g.ChannelList.Refresh()
+						if g.ActiveChannel == id {
+							g.ActiveChannel = "global-chat" // Fallback
+							g.refreshChat()
+						}
+					}
+				}, g.Win)
 			}
 		},
 	)
@@ -108,12 +146,13 @@ func (g *GUI) setupUI() {
 		g.ChannelList.Refresh()
 	}
 
-	addChannelBtn := widget.NewButtonWithIcon("Join Channel", theme.ContentAddIcon(), func() {
+	addChannelBtn := widget.NewButtonWithIcon("Join/Create", theme.ContentAddIcon(), func() {
 		g.showAddChannelDialog()
 	})
 
+	// Combine Sidebar Elements
 	sidebar := container.NewBorder(
-		widget.NewLabelWithStyle("Channels", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}), 
+		profileBox, 
 		addChannelBtn, 
 		nil, nil, 
 		g.ChannelList,
@@ -133,11 +172,11 @@ func (g *GUI) setupUI() {
 			return
 		}
 
-		// Optimistic UI Update
+		// Optimistic update
 		g.Node.Mutex.Lock()
 		if ch, ok := g.Node.Channels[g.ActiveChannel]; ok {
 			ch.Messages = append(ch.Messages, ChatMessage{
-				SenderID:   g.Node.ID,
+				SenderID:   g.Node.StableID,
 				SenderName: g.Node.Nick,
 				Content:    s,
 				Timestamp:  time.Now().Unix(),
@@ -156,22 +195,36 @@ func (g *GUI) setupUI() {
 	inputBar := container.NewBorder(nil, nil, nil, sendBtn, g.MsgInput)
 	mainContent := container.NewBorder(nil, inputBar, nil, nil, scroll)
 
-	// Split View
 	split := container.NewHSplit(sidebar, mainContent)
 	split.SetOffset(0.3)
 
 	g.Win.SetContent(split)
 }
 
+// Updated Dialog to include Password
 func (g *GUI) showAddChannelDialog() {
-	input := widget.NewEntry()
-	input.PlaceHolder = "Channel Name/ID"
+	idEntry := widget.NewEntry()
+	idEntry.PlaceHolder = "Channel Name/ID"
 	
-	dialog.ShowCustomConfirm("Join Channel", "Join", "Cancel", input, func(ok bool) {
-		if ok && input.Text != "" {
-			name := strings.TrimSpace(input.Text)
-			g.Node.JoinChannel(name)
-			g.ChannelList.Refresh()
+	passEntry := widget.NewEntry()
+	passEntry.PlaceHolder = "Password (Optional)"
+	
+	content := container.NewVBox(
+		widget.NewLabel("Channel ID:"),
+		idEntry,
+		widget.NewLabel("Password (for encryption):"),
+		passEntry,
+	)
+	
+	dialog.ShowCustomConfirm("Join Channel", "Join", "Cancel", content, func(ok bool) {
+		if ok {
+			id := strings.TrimSpace(idEntry.Text)
+			pass := strings.TrimSpace(passEntry.Text)
+			
+			if id != "" {
+				g.Node.JoinChannel(id, pass)
+				g.ChannelList.Refresh()
+			}
 		}
 	}, g.Win)
 }
@@ -189,13 +242,12 @@ func (g *GUI) refreshChat() {
 		return
 	}
 
-	// Mark read
 	g.Node.Mutex.Lock()
 	ch.Unread = 0
 	g.Node.Mutex.Unlock()
 
 	for _, msg := range ch.Messages {
-		isMe := msg.SenderID == g.Node.ID
+		isMe := msg.SenderID == g.Node.StableID
 		g.ChatContainer.Add(g.createBubble(msg, isMe))
 	}
 	g.ChatContainer.Refresh()
@@ -203,7 +255,9 @@ func (g *GUI) refreshChat() {
 
 func (g *GUI) createBubble(msg ChatMessage, isMe bool) fyne.CanvasObject {
 	ts := time.Unix(msg.Timestamp, 0).Format("15:04")
-	nameLabel := canvas.NewText(fmt.Sprintf("%s (%s)", msg.SenderName, msg.SenderID[:4]), color.Gray{Y: 100})
+	nameTxt := fmt.Sprintf("%s (%s)", msg.SenderName, msg.SenderID[:4])
+	
+	nameLabel := canvas.NewText(nameTxt, color.Gray{Y: 100})
 	nameLabel.TextSize = 10
 	nameLabel.TextStyle = fyne.TextStyle{Bold: true}
 	
