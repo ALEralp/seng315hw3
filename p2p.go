@@ -2,9 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"os"
 	"sync"
 	"time"
 
@@ -12,14 +20,16 @@ import (
 	"github.com/libp2p/go-libp2p"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 )
 
-// DiscoveryServiceTag is unique to V2 to avoid mixing with V4 peers
-var DiscoveryServiceTag = "p2p-chat-v2"
+var (
+	DiscoveryServiceTag = "p2p-chat-v3" // Updated tag for V3
+	DataFile            = "data.json"
+)
 
-// ChatMessage is the plain data sent over the network
+// ChatMessage: The actual content
 type ChatMessage struct {
 	ID         string `json:"id"`
 	ChannelID  string `json:"channel_id"`
@@ -29,12 +39,29 @@ type ChatMessage struct {
 	Timestamp  int64  `json:"timestamp"`
 }
 
+// WireMessage: The envelope (Plaintext OR Encrypted)
+type WireMessage struct {
+	Type    string `json:"type"`            // "plaintext" or "encrypted"
+	Payload string `json:"payload"`         // JSON(ChatMessage) OR Hex(EncryptedBlob)
+	Nonce   string `json:"nonce,omitempty"` // For encryption
+}
+
 type Channel struct {
 	ID       string
+	Password string // New in V3
 	Topic    *pubsub.Topic
 	Sub      *pubsub.Subscription
 	Messages []ChatMessage
 	Unread   int
+}
+
+// SavedData: Struct for JSON persistence
+type SavedData struct {
+	Nick     string `json:"nick"`
+	Channels []struct {
+		ID       string `json:"id"`
+		Password string `json:"password"`
+	} `json:"channels"`
 }
 
 type P2PNode struct {
@@ -44,18 +71,15 @@ type P2PNode struct {
 	Cancel         context.CancelFunc
 	Channels       map[string]*Channel
 	Nick           string
-	ID             string // Simple ephemeral ID for V2
+	StableID       string 
 	ChannelUpdates chan string
 	Mutex          sync.RWMutex
 }
 
-func NewP2PNode(nick string) (*P2PNode, error) {
+func NewP2PNode(defaultNick string) (*P2PNode, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Basic Host Setup
-	h, err := libp2p.New(
-		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
-	)
+	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
 	if err != nil {
 		cancel()
 		return nil, err
@@ -67,26 +91,37 @@ func NewP2PNode(nick string) (*P2PNode, error) {
 		return nil, err
 	}
 
-	return &P2PNode{
+	// Load or Generate Stable Identity
+	stableID, err := getStableIdentity()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	node := &P2PNode{
 		Host:           h,
 		PubSub:         ps,
 		Ctx:            ctx,
 		Cancel:         cancel,
 		Channels:       make(map[string]*Channel),
-		Nick:           nick,
-		ID:             h.ID().ShortString(),
+		Nick:           defaultNick,
+		StableID:       stableID,
 		ChannelUpdates: make(chan string, 100),
-	}, nil
+	}
+
+	// Load persistent data (Nick, Channels)
+	node.LoadData()
+
+	return node, nil
 }
 
 func (n *P2PNode) Start() error {
-	// Setup MDNS for local discovery
 	s := mdns.NewMdnsService(n.Host, DiscoveryServiceTag, &discoveryNotifee{h: n.Host})
 	return s.Start()
 }
 
-// JoinChannel adds the logic to support multiple rooms
-func (n *P2PNode) JoinChannel(channelID string) error {
+// JoinChannel updated to accept Password
+func (n *P2PNode) JoinChannel(channelID, password string) error {
 	n.Mutex.Lock()
 	defer n.Mutex.Unlock()
 
@@ -107,6 +142,7 @@ func (n *P2PNode) JoinChannel(channelID string) error {
 
 	ch := &Channel{
 		ID:       channelID,
+		Password: password, // Store password
 		Topic:    topic,
 		Sub:      sub,
 		Messages: []ChatMessage{},
@@ -115,6 +151,9 @@ func (n *P2PNode) JoinChannel(channelID string) error {
 	n.Channels[channelID] = ch
 	go n.readLoop(ch)
 	
+	// Auto-save when joining
+	go n.SaveData()
+
 	return nil
 }
 
@@ -127,9 +166,10 @@ func (n *P2PNode) LeaveChannel(channelID string) {
 		ch.Topic.Close()
 		delete(n.Channels, channelID)
 	}
+	go n.SaveData()
 }
 
-// SendMessage sends plain JSON (Encryption added in V3)
+// SendMessage updated to handle Encryption
 func (n *P2PNode) SendMessage(channelID, content string) error {
 	n.Mutex.RLock()
 	ch, exists := n.Channels[channelID]
@@ -139,21 +179,40 @@ func (n *P2PNode) SendMessage(channelID, content string) error {
 		return errors.New("channel not found")
 	}
 
-	msg := ChatMessage{
+	chatMsg := ChatMessage{
 		ID:         uuid.New().String(),
 		ChannelID:  channelID,
-		SenderID:   n.ID,
+		SenderID:   n.StableID, // Use StableID
 		SenderName: n.Nick,
 		Content:    content,
 		Timestamp:  time.Now().Unix(),
 	}
 
-	msgBytes, err := json.Marshal(msg)
+	msgBytes, err := json.Marshal(chatMsg)
 	if err != nil {
 		return err
 	}
 
-	return ch.Topic.Publish(n.Ctx, msgBytes)
+	var wireMsg WireMessage
+
+	if ch.Password != "" {
+		// Encrypt
+		encrypted, nonce, err := encrypt(string(msgBytes), ch.Password)
+		if err != nil {
+			return err
+		}
+		wireMsg = WireMessage{Type: "encrypted", Payload: encrypted, Nonce: nonce}
+	} else {
+		// Plaintext
+		wireMsg = WireMessage{Type: "plaintext", Payload: string(msgBytes)}
+	}
+
+	wireBytes, err := json.Marshal(wireMsg)
+	if err != nil {
+		return err
+	}
+
+	return ch.Topic.Publish(n.Ctx, wireBytes)
 }
 
 func (n *P2PNode) readLoop(ch *Channel) {
@@ -162,14 +221,33 @@ func (n *P2PNode) readLoop(ch *Channel) {
 		if err != nil {
 			return
 		}
-
-		// Don't process our own messages from the network loop
 		if msg.ReceivedFrom == n.Host.ID() {
 			continue
 		}
 
+		var wireMsg WireMessage
+		if err := json.Unmarshal(msg.Data, &wireMsg); err != nil {
+			continue
+		}
+
+		var payloadBytes []byte
+
+		if wireMsg.Type == "encrypted" {
+			if ch.Password == "" {
+				continue // Cannot decrypt without password
+			}
+			decrypted, err := decrypt(wireMsg.Payload, wireMsg.Nonce, ch.Password)
+			if err != nil {
+				fmt.Println("Decryption failed:", err)
+				continue
+			}
+			payloadBytes = []byte(decrypted)
+		} else {
+			payloadBytes = []byte(wireMsg.Payload)
+		}
+
 		var chatMsg ChatMessage
-		if err := json.Unmarshal(msg.Data, &chatMsg); err != nil {
+		if err := json.Unmarshal(payloadBytes, &chatMsg); err != nil {
 			continue
 		}
 
@@ -182,12 +260,106 @@ func (n *P2PNode) readLoop(ch *Channel) {
 	}
 }
 
-type discoveryNotifee struct {
-	h host.Host
+// --- Persistence ---
+
+func (n *P2PNode) SaveData() {
+	n.Mutex.RLock()
+	defer n.Mutex.RUnlock()
+
+	data := SavedData{
+		Nick: n.Nick,
+		Channels: make([]struct {
+			ID       string `json:"id"`
+			Password string `json:"password"`
+		}, 0, len(n.Channels)),
+	}
+
+	for _, ch := range n.Channels {
+		data.Channels = append(data.Channels, struct {
+			ID       string `json:"id"`
+			Password string `json:"password"`
+		}{ID: ch.ID, Password: ch.Password})
+	}
+
+	bytes, _ := json.MarshalIndent(data, "", "  ")
+	_ = ioutil.WriteFile(DataFile, bytes, 0644)
 }
 
-func (d *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	if pi.ID != d.h.ID() {
-		d.h.Connect(context.Background(), pi)
+func (n *P2PNode) LoadData() {
+	bytes, err := ioutil.ReadFile(DataFile)
+	if err != nil {
+		return
 	}
+
+	var data SavedData
+	if err := json.Unmarshal(bytes, &data); err != nil {
+		return
+	}
+
+	if data.Nick != "" {
+		n.Nick = data.Nick
+	}
+
+
+	for _, chData := range data.Channels {
+		go n.JoinChannel(chData.ID, chData.Password)
+	}
+}
+
+// --- Helpers ---
+
+func getStableIdentity() (string, error) {
+	if _, err := os.Stat("identity.key"); err == nil {
+		data, err := ioutil.ReadFile("identity.key")
+		return string(data), err
+	}
+	id := uuid.New().String()
+	_ = ioutil.WriteFile("identity.key", []byte(id), 0600)
+	return id, nil
+}
+
+func encrypt(plaintext, password string) (string, string, error) {
+	key := sha256.Sum256([]byte(password))
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return "", "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", "", err
+	}
+	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
+	return hex.EncodeToString(ciphertext), hex.EncodeToString(nonce), nil
+}
+
+func decrypt(ciphertextHex, nonceHex, password string) (string, error) {
+	key := sha256.Sum256([]byte(password))
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	ciphertext, err := hex.DecodeString(ciphertextHex)
+	nonce, err := hex.DecodeString(nonceHex)
+	if err != nil {
+		return "", err
+	}
+	if len(ciphertext) < gcm.NonceSize() {
+		return "", errors.New("ciphertext too short")
+	}
+	// GCM Open handles authentication tag check
+	plaintext, err := gcm.Open(nil, nonce, ciphertext[gcm.NonceSize():], nil)
+	return string(plaintext), err
+}
+
+type discoveryNotifee struct{ h host.Host }
+func (d *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	if pi.ID != d.h.ID() { d.h.Connect(context.Background(), pi) }
 }
